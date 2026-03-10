@@ -1,9 +1,13 @@
 import logging
+import re
 import requests
 from dotenv import load_dotenv
 import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, ConversationHandler, filters
+)
 
 load_dotenv()
 
@@ -16,6 +20,25 @@ WP_APP_PASSWORD = os.environ["WP_APP_PASSWORD"]
 
 INVENTORY_URL = "https://ucusnack.com/wp-json/mulopimfwc/v1/inventory/export"
 WC_PRODUCT_URL = "https://ucusnack.com/wp-json/wc/v3/products"
+INVENTORY_UPDATE_URL = "https://ucusnack.com/wp-json/mulopimfwc/v1/inventory/update"
+
+LOCATION_IDS = {
+    "K1 крило Тригуб": 43,
+    "К1 крило Волощак": 37,
+    "К1 крило Гнилиці": 39,
+    "К1 крило Журби": 41,
+    "К1 крило Квасюків": 42,
+    "К1 крило Куки": 40,
+    "К1 крило Мисяковського": 38,
+    "К1 крило Плетених": 35,
+    "К2 крило Байковських": 44,
+    "К2 крило Жолдак": 47,
+    "К2 крило Мельників і Лучників": 45,
+    "К2 крило Мельниченка": 48,
+    "К2 крило Нагорних": 46,
+    "К2 крило Федини": 34,
+    "Студпростір": 49,
+}
 
 K1_WINGS = {
     "K1 крило Тригуб",
@@ -102,6 +125,8 @@ TARGET_STOCK = {
     'BOB SNAIL Яблучно-грушеві цукерки': 0,
 }
 
+CHOOSING_LOCATION, WAITING_FOR_UPDATE = range(2)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -143,8 +168,8 @@ def fetch_inventory():
         product_info[pid]["wings_total"] += current
 
         # Визначаємо target залежно від групи крила
-        if loc_name in K2_WINGS and name in K2_EXCLUDED:
-            continue  # цей товар не відносимо в К2
+        if loc_name == "Студпростір" and name in K2_EXCLUDED:
+            continue  # цей товар не відносимо в студпростір
 
         target = TARGET_STOCK.get(name, 0)
         needed = max(0, target - current)
@@ -162,6 +187,46 @@ def fetch_inventory():
             warehouse_stock[info["name"]] = 0
 
     return location_map, warehouse_stock
+
+
+def get_product_id_map():
+    """Повертає словник назва товару -> product_id."""
+    auth = (WP_USER, WP_APP_PASSWORD)
+    items = []
+    page = 1
+    while True:
+        resp = requests.get(INVENTORY_URL, auth=auth, params={"page": page}, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        items.extend(payload.get("data", []))
+        if not payload.get("has_more"):
+            break
+        page += 1
+    return {item["product_name"].strip(): item["product_id"] for item in items}
+
+
+def get_location_stock(product_id, location_id):
+    """Отримує поточний stock товару на локації."""
+    auth = (WP_USER, WP_APP_PASSWORD)
+    items = []
+    page = 1
+    while True:
+        resp = requests.get(INVENTORY_URL, auth=auth, params={"page": page}, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        items.extend(payload.get("data", []))
+        if not payload.get("has_more"):
+            break
+        page += 1
+
+    for item in items:
+        if item["product_id"] == product_id and item["location_id"] == location_id:
+            stock_raw = item.get("stock", "")
+            try:
+                return int(stock_raw) if stock_raw != "" else 0
+            except (ValueError, TypeError):
+                return 0
+    return 0
 
 
 def get_group_location_map(location_map, group):
@@ -236,6 +301,26 @@ def split_text(text, max_len=4000):
         chunks.append("\n".join(chunk))
     return chunks
 
+def parse_update_message(text):
+    """
+    Парсить повідомлення формату:
+    • Milka Oreo — 1 шт.
+    • Coca Cola 0,33л — -2 шт.
+    Повертає список (назва, кількість).
+    """
+    results = []
+    lines = text.strip().split("\n")
+    pattern = re.compile(r"[•\-]?\s*(.+?)\s*[—\-]+\s*(-?\d+)")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        m = pattern.search(line)
+        if m:
+            name = m.group(1).strip().rstrip("—").strip()
+            qty = int(m.group(2))
+            results.append((name, qty))
+    return results
 
 # ──────────────────────────────────────────
 #  ХЕНДЛЕРИ
@@ -253,6 +338,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("🏭 Залишок на складі", callback_data="warehouse"),
         ],
+        [
+            InlineKeyboardButton("✏️ Оновити кількість", callback_data="update_start"),
+        ],
     ]
     await update.message.reply_text(
         "Привіт! Що хочеш подивитись?",
@@ -260,9 +348,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def view_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if query.data in ("update_start", "cancel") or query.data.startswith("updloc_"):
+        return
+    
     await query.edit_message_text("⏳ Збираю дані...")
 
     try:
@@ -301,13 +393,178 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Помилка API")
         await query.message.reply_text(f"❌ Помилка: {e}")
 
+# ──────────────────────────────────────────
+#  ХЕНДЛЕРИ — ОНОВЛЕННЯ КІЛЬКОСТІ
+# ──────────────────────────────────────────
+async def update_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [[InlineKeyboardButton(loc, callback_data=f"updloc_{loc}")]
+                for loc in sorted(LOCATION_IDS.keys())]
+    keyboard.append([InlineKeyboardButton("❌ Скасувати", callback_data="cancel")])
+
+    await query.edit_message_text(
+        "Вибери крило для оновлення:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSING_LOCATION
+
+
+async def location_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    location_name = query.data.replace("updloc_", "")
+    context.user_data["update_location"] = location_name
+
+    await query.edit_message_text(
+        f"📍 *{location_name}*\n\n"
+        f"Надішли список товарів у форматі:\n"
+        f"```\n"
+        f"• Milka Oreo — 1 шт.\n"
+        f"• Coca Cola 0,33л — 3 шт.\n"
+        f"• SNICKERS — -1 шт.\n"
+        f"```\n"
+        f"Або /cancel щоб скасувати.",
+        parse_mode="Markdown"
+    )
+    return WAITING_FOR_UPDATE
+
+
+async def process_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    auth = (WP_USER, WP_APP_PASSWORD)
+    location_name = context.user_data.get("update_location")
+    location_id = LOCATION_IDS.get(location_name)
+
+    if not location_id:
+        await update.message.reply_text("❌ Помилка: локацію не знайдено.")
+        return ConversationHandler.END
+
+    text = update.message.text
+    parsed = parse_update_message(text)
+
+    if not parsed:
+        await update.message.reply_text(
+            "❌ Не вдалось розпізнати список. Перевір формат:\n"
+            "• Назва товару — кількість шт."
+        )
+        return WAITING_FOR_UPDATE
+
+    # Отримати product_id map
+    await update.message.reply_text("⏳ Оновлюю...")
+    product_id_map = get_product_id_map()
+
+    results = []
+    errors = []
+
+    for name, qty in parsed:
+        pid = product_id_map.get(name)
+        if not pid:
+            errors.append(f"❓ Товар не знайдено: *{name}*")
+            continue
+
+        try:
+            # Отримати поточний stock на локації та загальний
+            current_loc_stock = get_location_stock(pid, location_id)
+            new_loc_stock = current_loc_stock + qty
+
+            wc_resp = requests.get(f"{WC_PRODUCT_URL}/{pid}", auth=auth, timeout=15)
+            current_wc = wc_resp.json().get("stock_quantity") or 0
+
+            # Оновити крило (плагін зіпсує stock_quantity)
+            requests.post(
+                INVENTORY_UPDATE_URL,
+                auth=auth,
+                json={"product_id": pid, "location_id": location_id, "stock": new_loc_stock},
+                timeout=15
+            )
+
+            # Виправити загальний stock залежно від знаку
+            if qty > 0:
+                # Товар перемістили зі складу на крило — загальний не змінюється
+                new_wc = current_wc
+            else:
+                # Товар списали — загальний зменшується
+                new_wc = current_wc + qty
+
+            # Відразу виправити загальний stock
+            requests.put(
+                f"{WC_PRODUCT_URL}/{pid}",
+                auth=auth,
+                json={"stock_quantity": new_wc},
+                timeout=15
+            )
+
+            sign = "+" if qty > 0 else ""
+            results.append(f"✅ {name}: {sign}{qty} шт.")
+
+        except Exception as e:
+            errors.append(f"❌ Помилка для *{name}*: {e}")
+
+    # Відповідь
+    response = f"📍 *{location_name}*\n\n"
+    if results:
+        response += "\n".join(results)
+    if errors:
+        response += "\n\n" + "\n".join(errors)
+
+    await update.message.reply_text(response, parse_mode="Markdown")
+
+    # Показати меню знову
+    keyboard = [
+        [
+            InlineKeyboardButton("📦 По крилах К1", callback_data="loc_k1"),
+            InlineKeyboardButton("📦 По крилах К2", callback_data="loc_k2"),
+        ],
+        [
+            InlineKeyboardButton("📋 По товарах К1", callback_data="prod_k1"),
+            InlineKeyboardButton("📋 По товарах К2", callback_data="prod_k2"),
+        ],
+        [InlineKeyboardButton("🏭 Залишок на складі", callback_data="warehouse")],
+        [InlineKeyboardButton("✏️ Оновити кількість", callback_data="update_start")],
+    ]
+    await update.message.reply_text(
+        "Готово! Що далі?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Скасовано.")
+    return ConversationHandler.END
+
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Скасовано.")
+    return ConversationHandler.END
 
 # ──────────────────────────────────────────
 #  ЗАПУСК
 # ──────────────────────────────────────────
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(update_start, pattern="^update_start$")],
+        states={
+            CHOOSING_LOCATION: [
+                CallbackQueryHandler(location_chosen, pattern="^updloc_"),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
+            ],
+            WAITING_FOR_UPDATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_update),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(view_handler))
+
     print("Бот запущено!")
     app.run_polling()
