@@ -95,7 +95,7 @@ TARGET_STOCK = {
     'MILKA Hazelnut (snack pack)': 2,
     'Milka Strawberry': 1,
     'Milka Oreo': 1,
-    'OREO cookies (4шт)' : 2,
+    'OREO cookies (6шт)' : 2,
     'OREO cookies (10шт)': 0,
     'PRINGLES original (маленькі)': 0,
     'PRINGLES зі смаком "Паприка"': 1,
